@@ -1,0 +1,96 @@
+name: Build vcam .deb
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: "Package scheme"
+        type: choice
+        options: [rootless, rootful]
+        default: rootless
+      media_path:
+        description: "Path to replacement media on device (empty = keep /tmp/test.png)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      SDK_VERSION: "16.5"   # matches TARGET in Makefile
+      SCHEME: ${{ inputs.scheme || 'rootless' }}
+      MEDIA_PATH: ${{ inputs.media_path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Install dependencies
+        run: |
+          brew install ldid make xz
+          # Theos needs GNU make >= 4; macOS ships 3.81
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Cache Theos + SDK
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.THEOS }}
+          key: theos-${{ runner.os }}-sdk${{ env.SDK_VERSION }}-v1
+
+      - name: Install Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
+
+      - name: Install iOS SDK
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          cd /tmp/sdks
+          git sparse-checkout set "iPhoneOS${SDK_VERSION}.sdk"
+          if [ ! -d "iPhoneOS${SDK_VERSION}.sdk" ]; then
+            echo "::error::iPhoneOS${SDK_VERSION}.sdk not found in theos/sdks"
+            exit 1
+          fi
+          mkdir -p "$THEOS/sdks"
+          cp -R "iPhoneOS${SDK_VERSION}.sdk" "$THEOS/sdks/"
+
+      - name: Patch media path
+        if: env.MEDIA_PATH != ''
+        working-directory: src
+        run: |
+          sed -i '' "s|@\"/tmp/test.png\"|@\"${MEDIA_PATH}\"|" image_utils.m
+          grep -n "kReplacementMediaPath =" image_utils.m
+
+      - name: Build package
+        working-directory: src
+        run: |
+          if [ "$SCHEME" = "rootless" ]; then
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          else
+            # Makefile hardcodes rootless; empty value on the command line overrides it
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=
+          fi
+          ls -la packages/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcam-${{ env.SCHEME }}
+          path: src/packages/*.deb
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src/packages/*.deb
